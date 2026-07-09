@@ -6,9 +6,11 @@ Voegt video's samen zonder MoviePy
 
 import os
 import sys
+import json
 import subprocess
 import shutil
 from pathlib import Path
+from collections import Counter
 import tempfile
 
 def get_video_files(folder_path):
@@ -59,12 +61,77 @@ def validate_video(video_file):
     except Exception:
         return False
  
+def probe_stream_info(video_file):
+    """Geeft (display_breedte, display_hoogte, heeft_audio) terug.
+    Houdt rekening met rotatie-metadata van telefoons (portrait-filmpjes).
+    Geeft None terug als proben mislukt."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_streams',
+            '-of', 'json',
+            str(video_file)
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=10, text=True)
+        if result.returncode != 0:
+            return None
+
+        data = json.loads(result.stdout)
+        width = height = None
+        has_audio = False
+
+        for stream in data.get('streams', []):
+            if stream.get('codec_type') == 'audio':
+                has_audio = True
+            elif stream.get('codec_type') == 'video' and width is None:
+                width = int(stream['width'])
+                height = int(stream['height'])
+                rotation = 0
+                for sd in stream.get('side_data_list', []):
+                    if 'rotation' in sd:
+                        rotation = int(sd['rotation'])
+                if not rotation:
+                    rotation = int(stream.get('tags', {}).get('rotate', 0))
+                if abs(rotation) % 180 == 90:
+                    width, height = height, width
+
+        if width is None:
+            return None
+        return (width, height, has_audio)
+    except Exception:
+        return None
+
+
+def choose_target_resolution(dimensions):
+    """Kies doelresolutie: de meest voorkomende liggende resolutie, anders 1920x1080"""
+    landscape = [(w, h) for (w, h) in dimensions if w >= h]
+    if landscape:
+        w, h = Counter(landscape).most_common(1)[0][0]
+    else:
+        w, h = 1920, 1080
+    # libx264 vereist even afmetingen
+    return (w - w % 2, h - h % 2)
+
+
+def build_normalize_filter(target_w, target_h):
+    """Filter dat elke clip in target_w x target_h past:
+    - liggende clips vullen (vrijwel) het hele beeld
+    - portrait-clips komen gecentreerd op een geblurde uitvergroting van zichzelf"""
+    return (
+        f"split[bg][fg];"
+        f"[bg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},gblur=sigma=30[bgb];"
+        f"[fg]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease[fgs];"
+        f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[vout]"
+    )
+
+
 def ask_mode():
     """Vraag de gebruiker welke merge-modus gewenst is"""
     print("Kies een modus:")
     print("  1 - Directe merge (geen check, geen conversie - snelst)")
     print("  2 - Check + directe merge (ongeldige bestanden overslaan)")
-    print("  3 - Check + H.264 kopie + merge (traagst, meest robuust)")
+    print("  3 - Check + normaliseren + merge (portrait krijgt geblurde achtergrond - traagst, meest robuust)")
     while True:
         keuze = input("\nKeuze [1/2/3]: ").strip()
         if keuze in ('1', '2', '3'):
@@ -104,24 +171,58 @@ def do_concat(video_files, output_name):
 
 
 def do_h264_then_concat(video_files, output_name):
-    """Fase 1: elk bestand individueel naar H.264, fase 2: samenvoegen via stream-copy"""
+    """Fase 1: elk bestand naar H.264 in één uniform liggend formaat
+    (portrait-clips gecentreerd op geblurde achtergrond), fase 2: samenvoegen via stream-copy"""
     temp_dir = tempfile.mkdtemp(prefix="videomerge_")
     temp_files = []
     skipped = []
 
     try:
+        # Eerst alle afmetingen proben om doelresolutie en portrait-clips te bepalen
+        print(f"\n📐 Afmetingen bepalen...")
+        infos = {}
+        dimensions = []
+        for video_file in video_files:
+            info = probe_stream_info(video_file)
+            infos[video_file] = info
+            if info:
+                dimensions.append((info[0], info[1]))
+
+        target_w, target_h = choose_target_resolution(dimensions)
+        portrait_count = sum(1 for (w, h) in dimensions if h > w)
+        print(f"✓ Doelresolutie: {target_w}x{target_h}"
+              f" ({portrait_count} portrait-clip(s) krijgen geblurde achtergrond)")
+
+        vf = build_normalize_filter(target_w, target_h)
+
         print(f"\n🔄 Fase 1: {len(video_files)} bestanden converteren naar H.264...")
         print(f"⚠️  Dit kan even duren - tijd voor koffie ☕")
 
         for i, video_file in enumerate(video_files, 1):
             temp_out = os.path.join(temp_dir, f"temp_{i:04d}.mp4")
-            print(f"  [{i}/{len(video_files)}] {video_file.name}...", end=" ", flush=True)
+            info = infos.get(video_file)
+            is_portrait = bool(info and info[1] > info[0])
+            has_audio = info[2] if info else True
+            marker = " 📱" if is_portrait else ""
+            print(f"  [{i}/{len(video_files)}] {video_file.name}{marker}...", end=" ", flush=True)
 
             cmd = [
                 'ffmpeg',
                 '-fflags', '+genpts+discardcorrupt',
                 '-err_detect', 'ignore_err',
                 '-i', str(video_file),
+            ]
+            if has_audio:
+                audio_map = ['-map', '0:a:0']
+            else:
+                # Stille audiotrack toevoegen zodat concat niet breekt op ontbrekende audio
+                cmd += ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000']
+                audio_map = ['-map', '1:a', '-shortest']
+
+            cmd += [
+                '-filter_complex', vf,
+                '-map', '[vout]',
+                *audio_map,
                 '-c:v', 'libx264',
                 '-preset', 'fast',
                 '-crf', '18',
